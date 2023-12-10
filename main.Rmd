@@ -1,0 +1,486 @@
+---
+title: "Fallstudie"
+date: "2023-11-28"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+# Load the DADA2 library
+library(dada2)
+
+# Set the working directory to your project folder
+setwd("~/fallstudie")
+
+# Load the conda environment with DADA2 (replace 'your_environment' with the actual environment name)
+system("conda activate dada2")
+
+# Create a vector of file names for forward and reverse reads
+fnFs <- list.files(path = "01_rawdata", pattern = "_R1_001.fastq", full.names = TRUE)
+fnRs <- list.files(path = "01_rawdata", pattern = "_R2_001.fastq", full.names = TRUE)
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+```
+
+##Quality control
+
+```{r pressure, echo=FALSE}
+# plot the quality control
+plotQualityProfile(fnFs[1:2])
+plotQualityProfile(fnRs[1:2])
+```
+
+```{r pressure, echo=FALSE}
+#get the filtered values
+filtFs <- file.path(path="~/fallstudie/03A_filtFs", paste0(sample.names, "_F_filt.fastq"))
+filtRs <- file.path(path="~/fallstudie/03B_filtRs", paste0(sample.names, "_R_filt.fastq"))
+
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(250,200),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=FALSE) # On Windows set multithread=FALSE ,
+head(out)
+
+#checking quality after triming
+fnFs2 <- list.files(path = "03A_filtFs", pattern = "_F_filt.fastq", full.names = TRUE)
+fnRs2 <- list.files(path = "03B_filtRs", pattern = "_R_filt.fastq", full.names = TRUE)
+# Assuming out is a list with elements fnFs and fnRs containing the paths to trimmed files
+```
+
+##Quality Control after Trimming
+
+```{r pressure, echo=FALSE}
+plotQualityProfile(fnFs2[1:2])  # # Trimmed forward reads
+plotQualityProfile(fnRs2[1:2])  # Trimmed Reverse reads
+```
+
+```{r pressure, echo=FALSE}
+#Learn the Error Rates
+errF <- learnErrors(filtFs, multithread=TRUE) 
+errR <- learnErrors(filtRs, multithread=TRUE)
+plotErrors(errF, nominalQ=TRUE)
+
+#Sample Inference
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+dadaFs[[1]]
+
+#Merge paired reads
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+
+#Construct sequence table
+#We can now construct an amplicon sequence variant table (ASV) table
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+#The sequence table is a matrix with rows corresponding to (and named by) the samples, and columns corresponding to (and named by) the sequence variants.
+
+#Remove chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+#sum(seqtab.nochim)/sum(seqtab)
+```
+
+##filtering the ASV table removing water related MOs
+
+```{r pressure, echo=FALSE}
+# Identify rows corresponding to H2O samples
+h2o_samples <- c("H2O-H1", "H2O-H2", "H2O-H3")
+
+# Step 1: Find the rows corresponding to H2O samples
+h2o_rows <- rownames(seqtab.nochim)[grepl("H2O-H[1-3]", rownames(seqtab.nochim))]
+h2o_rows
+# Step 2: Find columns where values are not equal to 0 for the identified rows
+non_zero_columns <- colnames(seqtab.nochim)[apply(seqtab.nochim[h2o_rows, ], 2, function(x) any(x != 0))]
+
+# Step 3: Filter out these columns for all rows
+filtered_seqtab <- seqtab.nochim[, -which(colnames(seqtab.nochim) %in% non_zero_columns)]
+# Omit rows corresponding to H2O samples
+filtered_seqtab <- filtered_seqtab[!grepl("H2O-H[1-3]", rownames(filtered_seqtab)), ]
+
+
+
+# Step 4: Save the filtered matrix table to a new file
+write.table(filtered_seqtab, file = "05_processed_data/filt_seqtab_nochim.csv", sep = ",", quote = FALSE)
+
+
+```
+
+```{r pressure, echo=FALSE}
+#Track reads through the pipeline
+#As a final check of our progress, we’ll look at the number of reads that made it through each step in the pipeline:
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+#Assign taxonomy
+taxa <- assignTaxonomy(filtered_seqtab, "~/fallstudie/silva_nr99_v138.1_train_set.fa.gz", multithread=TRUE)
+taxa <- addSpecies(taxa, "~/fallstudie/silva_species_assignment_v138.1.fa.gz")
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+#Saving the Result
+
+```{r pressure, echo=FALSE}
+# Save the results
+#write.table(taxa.print, file="05_processed_data/taxa_print.txt", sep="\t")
+write.table(filtered_seqtab, file="05_processed_data/filtered_seqtab.txt", sep="\t")
+#write.table(taxa, file="05_processed_data/taxonomy.txt", sep="\t")
+```
+
+#Phyloseq
+
+```{r pressure, echo=FALSE}
+library(phyloseq)
+library(readxl)
+
+# add EOTRH as dataframe
+
+metadata <- read_excel("EOTRH-MetadatenProben_studvers_2023.xlsx", 
+    skip = 1)
+
+# Set SeqPos as row names
+#rownames(taxa) 
+#Remove the SeqPos column from the data frame if needed
+#transpose
+filtered_seqtab <- t(filtered_seqtab)
+
+#check if the sample data is correct
+#colnames(filtered_seqtab) %in% metadata$SeqPos
+#rownames(filtered_seqtab) %in% rownames(taxa)
+
+
+# it should be true
+all(rownames(filtered_seqtab) %in% rownames(taxa))
+#cleaning the data 
+nrow(metadata)
+metadata <- metadata [1:15,]
+metadata$SeqPos <- gsub("-", "_", metadata$SeqPos, fixed=TRUE)
+colnames(filtered_seqtab) <- gsub("-", "_", colnames(filtered_seqtab), fixed=TRUE)
+metadata <- data.frame(metadata)
+rownames(metadata) <- metadata$SeqPos
+
+# Create the phyloseq object
+physeq <- phyloseq(otu_table(filtered_seqtab, taxa_are_rows = TRUE),
+                   sample_data(metadata),
+                   tax_table(taxa))
+
+
+#Check if phyloseq object was created correctly
+physeq
+nsamples(physeq) # number of samples
+ntaxa(physeq) # Number of taxa (ASV)
+sample_variables(physeq) # Number of sample variables
+rank_names(physeq) # ranking level
+
+# Print summary of the phyloseq object
+print(physeq)
+#save result
+write.csv(otu_table(physeq), file = "05_processed_data/physeq_table.csv")
+#short names for our ASVs
+#physeq <- merge_phyloseq(physeq, dna)
+#taxa_names(physeq_table) <- short_names
+Sequencedepth <- as.matrix(sample_sums(physeq))
+physeq = prune_samples(sample_sums(physeq)>=10,
+                               physeq)
+Sequencedepth <- as.matrix(sample_sums(physeq))
+
+
+#mean sequenced reads per sample after filtering
+mean(as.matrix(sample_sums(physeq)))
+
+#mean number of sequenced reads per ASV after filtering
+mean(as.matrix(taxa_sums(physeq)))
+nsamples(physeq) # number of samples
+
+```
+
+### Analysis
+
+```{r pressure, echo=FALSE}
+#load libraries
+library("phyloseq"); packageVersion("phyloseq")
+library("ggplot2"); packageVersion("ggplot2")
+
+# Define new phyloseq object with relative abundances (nomralization)
+physeq_rel = transform_sample_counts(physeq, function(x) x / sum(x)*100)
+
+
+#######extract files with taxon name
+#Extract abundance matrix from the phyloseq object with the taxon name as the row
+ASV1 = as.data.frame(otu_table(physeq))
+
+#create ASV2 matrix that contains the ASV names as row names and the corresponding taxonomy
+ASV2 = as.data.frame(tax_table(physeq))
+
+#combine the two matrices together by appending the rows together 
+ASV3 = cbind(ASV1, ASV2)
+ASV3[ASV3==0]<- NA # change zero values to NA
+
+#make the rownames into the first column of the matrix
+df <- data.frame(ASVs = row.names(ASV3), ASV3)
+rownames(df) = NULL
+str(ASV3)
+
+# save the table
+library (writexl)
+write_xlsx(df,"05_processed_data/phyloseq_ASVtable_with_ASVs.xlsx") 
+
+
+# Pivot (Genus)
+#install.packages("tidyverse")
+library (tidyverse)
+library(dplyr)
+ASV4 <-
+  ASV3 %>% 
+  select(-c(Kingdom, Phylum, Class, Order,Family)) %>% 
+  pivot_longer(!c(Genus, Species),
+               names_to="Sample", values_to="asv_count") %>% 
+  as.data.frame()
+
+
+head(ASV4)
+
+
+ASV5 <- aggregate(asv_count~Genus+Sample, data=ASV4, FUN=mean)
+head(ASV5)
+
+ASVF<- pivot_wider(data=ASV5, names_from=Genus, values_from=asv_count)
+
+
+
+library(funrar)
+ASVF1 <- ASVF[,-1] # remove the sample names for matrix
+ASVF1 <- as.matrix(ASVF1) # change it into matrix 
+rel_ASVF1 <- make_relative(ASVF1)  #calculate the relative abundance
+rel_ASVF1 <- rel_ASVF1*100 # multiply by 100
+rel_ASVF1 <- cbind(ASVF[1],rel_ASVF1) # add sample names to the dataframe
+
+
+# save the table
+ library (writexl)
+ write_xlsx(rel_ASVF1,"05_processed_data/phyloseq_ASVtable_with_Genus.xlsx") 
+ 
+ 
+ 
+ # Pivot (Species)
+ library (tidyverse)
+ ASV4 <-
+   ASV3 %>% 
+   select(-c(Kingdom, Phylum, Class, Order, Family)) %>% 
+   pivot_longer(!c(Genus, Species),
+                names_to="Sample", values_to="asv_count") %>% 
+   as.data.frame()
+ 
+ 
+ head(ASV4)
+ 
+ASV5 <- aggregate(asv_count~Species+Sample, data=ASV4, FUN=mean)
+ head(ASV5)
+ 
+ ASVF<- pivot_wider(data=ASV5, names_from=Species, values_from=asv_count)
+ 
+ 
+ library (writexl)
+ write_xlsx(ASVF,"05_processed_data/phyloseq_ASVtable_with_Species.xlsx") 
+ 
+ 
+# Filter rows where Genus is equal to "Tannerella"
+tannerella_samples <- ASV4 %>%
+  filter(Genus == "Tannerella")
+
+# Display the resulting data frame
+print(tannerella_samples)
+# Filter rows where asv_count is not NA
+valid_samples <- tannerella_samples[!is.na(tannerella_samples$asv_count), ]
+
+# Create a bar plot
+ggplot(valid_samples, aes(x = Sample, y = asv_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "ASV Counts for Tannerella Samples",
+       x = "Sample",
+       y = "ASV Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave("06_result/Tannerella Samples.png", width = 10, height = 6)
+
+
+# Check for unknown microorganisms in the "Genus" column
+unknown_microorganisms <- ASV4$Genus %in% c(NA, "unclassified", "unannotated", "unknown")
+
+# Count the occurrences of unknown microorganisms
+num_unknown_microorganisms <- sum(unknown_microorganisms)
+
+# Display the result
+cat("Number of unknown microorganisms in horses:", num_unknown_microorganisms, "\n")
+
+
+```
+
+### Multivariate analysis
+
+```{r pressure, echo=FALSE}
+
+#Show ASV in NMDS (different ranks)
+GP.ord <- ordinate(physeq_rel, "NMDS", "jaccard")
+p1 = plot_ordination(physeq_rel, GP.ord, type="taxa", color="Family", title="taxa")
+print(p1)
+ggsave("06_result/NMDS_ASV.jpg", height=5)
+
+# show NMDS in rank groups
+p1 + facet_wrap(~Family, 3)
+ggsave("06_result/NMDS_ASV_Ranking.jpg", width=9, height=5)
+
+
+
+
+
+
+
+# Samples in NMDS
+p2 = plot_ordination(physeq_rel, GP.ord, color="diseasestate") + 
+  ggtitle("diseasestate - NMDS: Jaccard") +
+  scale_color_manual(values=c("#39F3FC", "#518F42", "#FEDA6A", "#EE5E00",
+                             "#A7FF92", "#0A45E2", "#F1AAA4", "#CB3D0C",
+                             "#D7D5D5", "#7D7878", "#090A0B", "#CCB8A3",
+                             "#A88661", "#5C4833"
+  )) +
+  theme(legend.title = element_blank())
+p2
+ggsave("06_result/NMDS_plot_disease.jpg", width=10, height=5)
+
+
+p2 + geom_polygon(aes(fill=diseasestate)) + geom_point(size=3) + 
+  ggtitle("diseasestate - NMDS: Jaccard") +
+  scale_fill_manual(values=c("#39F3FC", "#518F42", "#FEDA6A", "#EE5E00",
+                             "#A7FF92", "#0A45E2", "#F1AAA4", "#CB3D0C",
+                             "#D7D5D5", "#7D7878", "#090A0B", "#CCB8A3",
+                             "#A88661", "#5C4833"
+  )) +
+  theme(legend.title = element_blank())
+
+ggsave("06_result//NMDS_polygon_diseasestate.jpg", width=10, height=5)
+
+
+library(phyloseq)
+install.packages("phyloseq")
+
+##PCoA
+# Calculate distances
+DistBC = distance(physeq_rel, method = "jaccard")
+
+
+#Perform "PCoA" Ordination
+ordBC = ordinate(physeq_rel, method = "PCoA", distance = DistBC)
+
+#Before exploring the PCoA plot, let's explore a property of each ordination itself. The eigenvalues associated with each axis indicate the relative proportion of total variability within the distance matrix that is represented in that axis. The axes are already ordered from most variability to least, and so a plot of these values in order of each axis gives a helpful impression as to which, and how many, axes we should bother plotting and interpreting.
+plot_scree(ordBC, "Scree Plot: Jaccard")
+
+#Finally, let's plot a PCoA the distance-and-ordination using the plot_ordination() function in phyloseq.
+PcoA <- plot_ordination(physeq_rel, ordBC, color = "diseasestate") + 
+  geom_point(size=3)+
+  ggtitle("diseasestate - PCoA: Jaccard") +
+scale_color_manual(values=c("#39F3FC", "#518F42", "#FEDA6A", "#EE5E00",
+                                     "#A7FF92", "#0A45E2", "#F1AAA4", "#CB3D0C",
+                                     "#D7D5D5", "#7D7878", "#090A0B", "#CCB8A3",
+                                     "#A88661", "#5C4833"
+)) 
+PcoA + theme(legend.title = element_blank())
+
+ggsave("06_result/PCoA_plot_jaccard_disease.jpg", width=8, height=5)
+
+
+
+##### PcoA Polygon
+PcoA + geom_polygon(aes(fill=diseasestate)) +
+  geom_point(size=3) +
+  ggtitle("diseasestate - PCoA: Jaccard") +
+  scale_fill_manual(values=c("#39F3FC", "#518F42", "#FEDA6A", "#EE5E00",
+                             "#A7FF92", "#0A45E2", "#F1AAA4", "#CB3D0C",
+                             "#D7D5D5", "#7D7878", "#090A0B", "#CCB8A3",
+                             "#A88661", "#5C4833")) +
+  theme(legend.title = element_blank())
+ggsave("06_result/PCoA_polygon_jaccard_disease.jpg", width=8, height=5)
+
+
+
+
+
+```
+
+###CA method
+
+```{r pressure, echo=FALSE}
+DistCA = distance(physeq_rel, method = "jaccard")
+
+#Perform "CA" Ordination
+ordCA = ordinate(physeq_rel, method = "CCA", distance = DistCA)
+
+#Before exploring the CA plot, let's explore a property of each ordination itself. The eigenvalues associated with each axis indicate the relative proportion of total variability within the distance matrix that is represented in that axis. The axes are already ordered from most variability to least, and so a plot of these values in order of each axis gives a helpful impression as to which, and how many, axes we should bother plotting and interpreting.
+plot_scree(ordCA, "Scree Plot: Jaccard")
+
+#Finally, let's plot a CA the distance-and-ordination using the plot_ordination() function in phyloseq.
+CA <- plot_ordination(physeq_rel, ordCA, color = "Type") + geom_point(size=3)+
+  ggtitle("Type - CA: Jaccard") +
+  scale_color_manual(values=c("#39F3FC", "#518F42", "#FEDA6A", "#EE5E00",
+                              "#A7FF92", "#0A45E2", "#F1AAA4", "#CB3D0C",
+                              "#D7D5D5", "#7D7878", "#090A0B", "#CCB8A3",
+                              "#A88661", "#5C4833"
+  )) 
+CA +  theme(legend.title = element_blank())
+ggsave("06_result/CA_plot_jaccard_type.jpg", width=8, height=5)
+
+
+
+
+```
+
+## 
+
+For that reason we'll store the DNA sequences of our ASVs in the refseq slot of the phyloseq object, and then rename our taxa to a short string. That way, the short new taxa names will appear in tables and plots, and we can still recover the DNA sequences corresponding to each ASV as needed with refseq(ps).
+
+```{r pressure, echo=FALSE}
+
+dna <- Biostrings::DNAStringSet(taxa_names(physeq))
+names(dna) <- taxa_names(physeq)
+physeq <- merge_phyloseq(physeq, dna)
+taxa_names(physeq) <- paste0("ASV", seq(ntaxa(physeq)))
+physeq
+tax_table(physeq)
+
+plot_richness_diseasestate <- plot_richness(physeq, measures=c("Shannon", "Simpson"), color="diseasestate")
+ggsave("06_result/plot_richness_diseasestate.png", plot = plot_richness_diseasestate)
+
+plot_richness_Type <- plot_richness(physeq, measures=c("Shannon", "Simpson"), color="Type")
+ggsave("06_result/plot_richness_Type.png", plot = plot_richness_Type)
+
+# Transform data to proportions as appropriate for Bray-Curtis distances
+ps.prop <- transform_sample_counts(physeq, function(otu) otu/sum(otu))
+ord.nmds.bray <- ordinate(ps.prop, method="NMDS", distance="bray")
+
+Bray_NMDS_diseasestate <-plot_ordination(ps.prop, ord.nmds.bray, color="diseasestate", title="Bray NMDS")
+ggsave("06_result/Bray_NMDS_diseasestate.png", plot = Bray_NMDS_diseasestate)
+
+Bray_NMDS_type <-plot_ordination(ps.prop, ord.nmds.bray, color="Type", title="Bray NMDS")
+ggsave("06_result/Bray_NMDS_type.png", plot = Bray_NMDS_type )
+
+top20 <- names(sort(taxa_sums(physeq), decreasing=TRUE))[1:20]
+ps.top20 <- transform_sample_counts(physeq, function(OTU) OTU/sum(OTU))
+ps.top20 <- prune_taxa(top20, ps.top20)
+Plotbar_diseasestate <-plot_bar(ps.top20, , fill="Family" ) + facet_wrap(~diseasestate, scales="free_x")
+ggsave("06_result/Plotbar_diseasestate.png", plot = Plotbar_diseasestate)
+
+Plotbar_type <-plot_bar(ps.top20, , fill="Family" ) + facet_wrap(~Type, scales="free_x")
+ggsave("06_result/Plotbar_type.png", plot = Plotbar_type)
+```
